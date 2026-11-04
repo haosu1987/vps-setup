@@ -1,0 +1,9 @@
+# label URL request-kind policy-note (whitespace separated; no credentials)
+google https://www.google.com/generate_204 page proxy-control
+youtube https://www.youtube.com/generate_204 page proxy-control
+example https://example.com/ page mode-dependent
+baidu https://www.baidu.com/ page domestic-control
+jd https://www.jd.com/ page domestic-control
+bilibili https://www.bilibili.com/ page domestic-control
+google-download https://dl.google.com/go/go1.23.0.src.tar.gz range domestic-CDN-not-proxy-throughput
+cloudflare-download https://speed.cloudflare.com/__down?bytes=1048576 download proxy-candidate-not-egress-proof

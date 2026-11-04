@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+if [ ! -f .private/deployment.json ]; then
+    echo 'BLOCK: configure a protected local deployment profile before publishing.' >&2
+    exit 1
+fi
+python3 tools/check-public-tree.py --profile .private/deployment.json

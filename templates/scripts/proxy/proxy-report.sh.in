@@ -1,0 +1,19 @@
+#!/bin/bash
+# Shared summary; HTTP success is not outbound/path proof. Accept only our CSV.
+set -euo pipefail
+[[ $# -gt 0 ]] || { echo 'Usage: proxy-report.sh METRICS.csv [...]' >&2; exit 2; }
+for file in "$@"; do
+    [[ $(head -1 "$file") == 'time_utc,platform,mode,target,attempt,policy_note,curl_exit,http,dns_s,connect_s,tls_s,ttfb_s,total_s,bytes,speed_Bps' ]] || { echo 'Unsupported metrics schema.' >&2; exit 2; }
+    awk -F, 'NR>1 && NF!=15 {bad=1} END {exit bad}' "$file"
+    printf 'mode,target,success,samples,median_success_total_s\n'
+    for target in google youtube example baidu jd bilibili google-download cloudflare-download; do
+        group=$(awk -F, -v t="$target" 'NR>1 && $4==t {print $3;exit}' "$file")
+        [[ -n "$group" ]] || continue
+        total=$(awk -F, -v t="$target" 'NR>1 && $4==t {n++} END{print n+0}' "$file")
+        values=$(awk -F, -v t="$target" 'NR>1 && $4==t && $7==0 && $8>=200 && $8<300 && (t !~ /download/ || $14==1048576) {print $13}' "$file" | sort -n)
+        median=$(printf '%s\n' "$values" | awk 'NF {a[++n]=$1} END {if(n) {if(n%2) print a[(n+1)/2]; else print (a[n/2]+a[n/2+1])/2} else print "unavailable"}')
+        count=$(printf '%s\n' "$values" | awk 'NF{n++} END{print n+0}')
+        printf '%s,%s,%s,%s,%s\n' "$group" "$target" "$count" "$total" "$median"
+    done
+done
+echo 'Scope: IPv4 samples only. Policy notes are hints, not observed egress. No speedup ratio for failed baselines.'

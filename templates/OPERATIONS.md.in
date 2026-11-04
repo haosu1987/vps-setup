@@ -1,0 +1,36 @@
+# 私有服务端操作手册
+
+本工作区仅包含服务端维护工具，不安装或启动 Mac 客户端。客户端使用 Happ。
+
+服务端脚本位于 `@@OUTPUT_DIR@@/scripts/proxy`，传至服务端受保护工作区后使用。首次安装前核对固定安装器摘要并保留备份；已有服务不重复安装。
+
+```bash
+sudo bash scripts/proxy/admin-preflight.sh
+sudo bash scripts/proxy/proxyctl.sh doctor
+```
+
+面板只经 SSH 隧道访问；真实参数和生成内容不得公开。备份与升级参见仓库服务端维护手册。
+
+## SSH 管理隧道
+
+在本机交互终端执行，保持窗口打开，再访问回环面板及密码管理器中保存的路径：
+
+```bash
+ssh -N -L @@PANEL_PORT@@:127.0.0.1:@@PANEL_PORT@@ -p @@SSH_PORT@@ @@SSH_TARGET@@
+```
+
+## 服务端工具
+
+在服务器 `@@PROJECT_DIR@@` 的完整工作区执行，已有服务不要重复安装：
+
+| 脚本 | 作用与影响 |
+| --- | --- |
+| `proxyctl.sh doctor` | 只读服务状态；root 时审计配置 |
+| `backup-server.py` | 写受保护备份并隔离校验，不停止服务 |
+| `audit-server.py` | 只读结构与核心语法审计 |
+| `configure-server-logging.py` | 修改日志与单元配置，并重启服务 |
+| `prepare-inbound-bbr.py` | 检查并按需加载 BBR 模块，不改全局 TCP/qdisc |
+| `persist-inbound-bbr.py` | 保存本方案模块加载和单元顺序配置 |
+| `verify-after-reboot.py` | 只读核对既有启动前基线 |
+
+以上文件位于 `scripts/proxy/`。写配置、升级与重启操作先保留备份，在已授权范围执行。客户端使用 Happ，不传输旧 Mac 工具。

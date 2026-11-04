@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fresh, interactive installation only. Upstream installer remains unmodified.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo 'Run with sudo in your terminal.' >&2; exit 1; }
+[[ -t 0 && -t 1 ]] || { echo 'Interactive terminal required; do not pipe input.' >&2; exit 1; }
+[[ $(uname -m) == x86_64 ]] || { echo 'This preparation targets x86_64 only.' >&2; exit 1; }
+for existing in @@XUI_INSTALL_DIR@@ @@XUI_DATA_DIR@@ /etc/systemd/system/x-ui.service /usr/bin/x-ui; do
+    [[ ! -e "$existing" ]] || { echo "Existing installation detected: $existing; stopping." >&2; exit 1; }
+done
+if ss -H -lnt '( sport = :@@PANEL_PORT@@ )' | grep -q .; then
+    echo 'Panel port @@PANEL_PORT@@ is occupied; stopping.' >&2
+    exit 1
+fi
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+upstream="$script_dir/vendor/3x-ui-v3.11.0-install.sh"
+expected=9684bae4f769b2127fcceceb4f200045657381311867529e6ba76c6b58e2825d
+actual=$(sha256sum "$upstream")
+[[ ${actual%% *} == "$expected" ]] || { echo 'Installer checksum mismatch.' >&2; exit 1; }
+echo 'Install choices: SQLite=1; custom port=y then @@PANEL_PORT@@; SSL=4; bind 127.0.0.1=y.'
+echo 'Keep generated credentials private. No input is supplied automatically.'
+# Disable optional netfilter/Fail2ban setup; never change the host firewall here.
+# Always check the actual listener after the official installer exits.
+export XUI_ENABLE_FAIL2BAN=false
+unset XUI_NONINTERACTIVE
+set +e
+(cd /root && bash "$upstream" v3.11.0)
+install_status=$?
+set -e
+if [[ -x @@XUI_INSTALL_DIR@@/x-ui ]]; then
+    # Reassert local binding even if a different interactive choice was entered.
+    if ! @@XUI_INSTALL_DIR@@/x-ui setting -listenIP 127.0.0.1 >/dev/null 2>&1; then
+        systemctl stop x-ui || true
+        echo 'Could not enforce local management binding; service stopped.' >&2
+        exit 1
+    fi
+    if systemctl is-active --quiet x-ui; then
+        systemctl restart x-ui
+        sleep 2
+    fi
+fi
+[[ $install_status -eq 0 ]] || { echo "Installer failed ($install_status); inspect locally without sharing secrets." >&2; exit "$install_status"; }
+if ! ss -H -lnt '( sport = :@@PANEL_PORT@@ )' | awk '{print $4}' | grep -qx '127.0.0.1:@@PANEL_PORT@@'; then
+    systemctl stop x-ui || true
+    echo 'Expected listener 127.0.0.1:@@PANEL_PORT@@ missing; service stopped for inspection.' >&2
+    exit 1
+fi
+if ss -H -lnt '( sport = :@@PANEL_PORT@@ )' | awk '{print $4}' | grep -qvx '127.0.0.1:@@PANEL_PORT@@'; then
+    systemctl stop x-ui || true
+    echo 'Unexpected panel listener; service stopped.' >&2
+    exit 1
+fi
+printf 'Panel installed. Expected local listener:\n'
+ss -H -lnt '( sport = :@@PANEL_PORT@@ )'
+systemctl is-active x-ui
+printf 'Proxy inbound is not configured yet. No firewall rules were intentionally changed.\n'

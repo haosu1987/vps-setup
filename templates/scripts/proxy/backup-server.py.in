@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Root-only online snapshot, SQLite-consistent backup and isolated restore check.
+
+Does not stop/restart services, change firewall rules, or overwrite live files.
+"""
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def capture(directory, name, command):
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    (directory / (name + '.stdout')).write_bytes(result.stdout)
+    (directory / (name + '.stderr')).write_bytes(result.stderr)
+    return result.stdout.decode(errors='replace') if result.returncode == 0 else None
+
+
+def sqlite_ok(path):
+    with sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True) as db:
+        return db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run: sudo python3 scripts/proxy/backup-server.py')
+    os.umask(0o077)
+    if not Path('@@XUI_DATA_DIR@@/x-ui.db').is_file():
+        raise SystemExit('Expected SQLite database missing; no backup created.')
+    base = Path(tempfile.mkdtemp(prefix='mac-reality-', dir='@@BACKUP_ROOT@@'))
+    base.chmod(0o700)
+    try:
+        stage = base / 'snapshot'
+        stage.mkdir(mode=0o700)
+        # Exclude the live SQLite files; capture them through SQLite backup below.
+        shutil.copytree('@@XUI_DATA_DIR@@', stage / 'etc-x-ui', symlinks=True,
+                        ignore=shutil.ignore_patterns('x-ui.db', 'x-ui.db-wal', 'x-ui.db-shm'))
+        with sqlite3.connect('file:@@XUI_DATA_DIR@@/x-ui.db?mode=ro', uri=True) as source:
+            with sqlite3.connect(stage / 'etc-x-ui/x-ui.db') as target:
+                source.backup(target)
+        if not sqlite_ok(stage / 'etc-x-ui/x-ui.db'):
+            raise RuntimeError('Database integrity verification failed')
+        shutil.copytree('@@XUI_INSTALL_DIR@@', stage / 'usr-local-x-ui', symlinks=True)
+        units = stage / 'systemd-system'
+        units.mkdir(mode=0o700)
+        for src in [Path('/etc/systemd/system/x-ui.service'), Path('/etc/systemd/system/x-ui.service.d')]:
+            if src.is_dir():
+                shutil.copytree(src, units / src.name, symlinks=True)
+            elif src.exists():
+                shutil.copy2(src, units / src.name)
+        if Path('/etc/default/x-ui').is_file():
+            shutil.copy2('/etc/default/x-ui', stage / 'x-ui.environment')
+        extra_files = []
+        for original in [Path('/etc/modules-load.d/mac-reality-bbr.conf'), Path('/etc/logrotate.d/mac-reality-xui')]:
+            if original.is_file():
+                relative = 'host-config/' + str(original).lstrip('/')
+                target = stage / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(original, target)
+                extra_files.append(relative)
+        observations = base / 'observations'
+        observations.mkdir(mode=0o700)
+        for name, command in [
+            ('unit', ['systemctl', 'cat', 'x-ui']),
+            ('status', ['systemctl', 'show', 'x-ui', '-p', 'ActiveState', '-p', 'SubState', '-p', 'UnitFileState', '-p', 'MemoryCurrent']),
+            ('ufw', ['ufw', 'status', 'verbose']),
+            ('nft', ['nft', '-j', 'list', 'ruleset']),
+            ('iptables', ['iptables-save']),
+            ('ip6tables', ['ip6tables-save']),
+            ('listeners', ['ss', '-lntup']),
+            ('routes', ['ip', 'route']),
+            ('version', ['@@XUI_INSTALL_DIR@@/bin/xray-linux-amd64', 'version']),
+        ]:
+            capture(observations, name, command)
+        files = ['etc-x-ui/x-ui.db', 'usr-local-x-ui/x-ui',
+                 'usr-local-x-ui/bin/xray-linux-amd64', 'usr-local-x-ui/bin/config.json']
+        files.extend(extra_files)
+        hashes = {name: digest(stage / name) for name in files if (stage / name).is_file()}
+        (stage / 'checksums.json').write_text(json.dumps(hashes, indent=2) + '\n')
+        archive = base / 'snapshot.tar.gz'
+        with tarfile.open(archive, 'w:gz', compresslevel=6) as out:
+            out.add(stage, arcname='snapshot')
+        archive.chmod(0o600)
+        # Restore to a fresh private directory only; never touch production paths.
+        verify = base / 'restore-check'
+        verify.mkdir(mode=0o700)
+        with tarfile.open(archive, 'r:gz') as src:
+            src.extractall(verify, filter='data')
+        restored = verify / 'snapshot'
+        if not sqlite_ok(restored / 'etc-x-ui/x-ui.db'):
+            raise RuntimeError('Restored database integrity failed')
+        if not all(digest(restored / name) == value for name, value in hashes.items()):
+            raise RuntimeError('Restored file verification failed')
+        version = subprocess.run([str(restored / 'usr-local-x-ui/bin/xray-linux-amd64'), 'version'],
+                                 capture_output=True, timeout=10)
+        if version.returncode != 0:
+            raise RuntimeError('Restored binary version check failed')
+        report = {
+            'sqlite_integrity': 'PASS', 'isolated_restore': 'PASS',
+            'restored_file_hashes': 'PASS', 'restored_binary_version': 'PASS',
+            'archive_sha256': digest(archive), 'archive_bytes': archive.stat().st_size,
+            'production_services_modified': False, 'firewall_modified': False,
+        }
+        (base / 'verification.json').write_text(json.dumps(report, indent=2) + '\n')
+        shutil.rmtree(stage)
+        shutil.rmtree(verify)
+        print('Backup:', archive)
+        print('SQLite integrity: PASS')
+        print('Isolated restore and file hashes: PASS')
+        print('Restored Xray executable: PASS')
+        print('Archive SHA256:', report['archive_sha256'])
+        print('Archive size MiB:', round(report['archive_bytes'] / 1024 / 1024, 1))
+        nft = observations / 'nft.stdout'
+        try:
+            ruleset = json.loads(nft.read_text())['nftables']
+            print('nft rule count:', sum('rule' in item for item in ruleset))
+            policies = [item['chain'].get('policy') for item in ruleset if item.get('chain', {}).get('hook') == 'input']
+            print('nft input policies:', ','.join(policies) if policies else '(none)')
+        except (OSError, KeyError, ValueError):
+            print('nft summary unavailable; original output retained privately.')
+        for name in ['iptables', 'ip6tables']:
+            try:
+                lines = (observations / (name + '.stdout')).read_text().splitlines()
+                policies = [line.split()[1] for line in lines if line.startswith(':INPUT ')]
+                print(name + ' INPUT policies:', ','.join(policies) if policies else '(none)')
+                print(name + ' rule count:', sum(line.startswith('-A ') for line in lines))
+            except OSError:
+                print(name + ' unavailable')
+        print('Services and firewall unchanged. Backup contains secrets; keep it root-only and do not upload it.')
+    except Exception as error:
+        print('Backup incomplete:', type(error).__name__)
+        print('Protected partial files:', base)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

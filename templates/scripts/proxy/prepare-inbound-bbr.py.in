@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Make the installed BBR module available without changing global TCP defaults."""
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+def value(name):
+    return Path('/proc/sys/' + name.replace('.', '/')).read_text().strip()
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo python3 scripts/proxy/prepare-inbound-bbr.py')
+    os.umask(0o077)
+    original = value('net.ipv4.tcp_congestion_control')
+    qdisc = value('net.core.default_qdisc')
+    before = value('net.ipv4.tcp_available_congestion_control')
+    folder = Path(tempfile.mkdtemp(prefix='mac-reality-bbr-', dir='@@BACKUP_ROOT@@'))
+    folder.chmod(0o700)
+    (folder/'before.json').write_text(json.dumps({
+        'global_congestion': original, 'default_qdisc': qdisc,
+        'available_algorithms': before, 'module_was_loaded': Path('/sys/module/tcp_bbr').exists(),
+    }, indent=2)+'\n')
+    result = subprocess.run(['modprobe', 'tcp_bbr'], capture_output=True, timeout=20)
+    if result.returncode != 0:
+        raise SystemExit('BBR module load failed; no sysctl/qdisc/service changes were made.')
+    available = value('net.ipv4.tcp_available_congestion_control')
+    if 'bbr' not in available.split():
+        raise SystemExit('BBR is not available; leave the panel congestion field unchanged.')
+    if value('net.ipv4.tcp_congestion_control') != original or value('net.core.default_qdisc') != qdisc:
+        raise SystemExit('Global settings changed concurrently; inspect before proceeding.')
+    print('BBR available:', available)
+    print('Global TCP algorithm retained:', original)
+    print('Default qdisc retained:', qdisc)
+    print('Preparation snapshot:', folder)
+    print('No proxy config or service restart performed. Select bbr only on the mac-reality inbound in the panel.')
+
+
+if __name__ == '__main__':
+    main()

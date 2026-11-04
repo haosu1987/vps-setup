@@ -1,0 +1,8 @@
+# Private inputs, executable deployment artifacts and installation/data caches.
+/.private/
+/scripts/
+/deploy/
+__pycache__/
+*.pyc
+*.local.*
+*.bundle

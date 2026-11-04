@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+if [ ! -f .private/deployment.json ]; then
+    echo 'BLOCK: configure a protected local deployment profile before publishing.' >&2
+    exit 1
+fi
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in
+        0000000000000000000000000000000000000000) continue ;;
+    esac
+    python3 tools/check-public-tree.py --profile .private/deployment.json --history "$local_sha"
+done

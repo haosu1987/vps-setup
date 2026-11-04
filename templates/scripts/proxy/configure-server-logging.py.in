@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Apply scoped log rotation/rate limits after verified backup and core upgrade."""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+PROFILE = Path('/etc/logrotate.d/mac-reality-xui')
+DROPIN = Path('/etc/systemd/system/x-ui.service.d/50-mac-reality-logging.conf')
+ROTATE = '''@@XUI_LOG_DIR@@/*.log {
+    daily
+    maxsize 10M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+'''
+LIMIT = '''[Service]
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+'''
+
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError('Command failed: ' + args[0])
+    return result.stdout.decode(errors='replace')
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        for part in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(part)
+    return h.hexdigest()
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo python3 scripts/proxy/configure-server-logging.py')
+    os.umask(0o077)
+    version = command(['@@XUI_INSTALL_DIR@@/bin/xray-linux-amd64', 'version']).splitlines()[0]
+    if not version.startswith('Xray 26.10.31 '):
+        raise SystemExit('Upgrade the Xray core to 26.10.31 through the panel first. No logging changes made.')
+    reports = list(Path('@@BACKUP_ROOT@@').glob('mac-reality-*/verification.json'))
+    reports.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if not reports:
+        raise SystemExit('No verified backup found; no changes made.')
+    report = json.loads(reports[0].read_text())
+    if report.get('isolated_restore') != 'PASS' or digest(reports[0].parent/'snapshot.tar.gz') != report.get('archive_sha256'):
+        raise SystemExit('Backup verification failed; no changes made.')
+    for path in Path('/etc/logrotate.d').iterdir():
+        if path == PROFILE or not path.is_file():
+            continue
+        text = path.read_text(errors='replace')
+        if '@@XUI_LOG_DIR@@' in text:
+            raise SystemExit('An existing x-ui rotation profile requires review; no changes made.')
+    command(['systemctl', 'is-active', 'x-ui'])
+    backup = Path(tempfile.mkdtemp(prefix='mac-reality-logging-', dir='@@BACKUP_ROOT@@'))
+    backup.chmod(0o700)
+    previous = {}
+    try:
+        for path, text in [(PROFILE, ROTATE), (DROPIN, LIMIT)]:
+            if path.is_symlink():
+                raise RuntimeError('Refusing symlink configuration')
+            previous[path] = path.read_bytes() if path.exists() else None
+            if path.exists():
+                shutil.copy2(path, backup/path.name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, stage_name = tempfile.mkstemp(prefix='.mac-reality-', dir=path.parent)
+            with os.fdopen(fd, 'w') as stage:
+                stage.write(text)
+            stage = Path(stage_name)
+            stage.chmod(0o644)
+            stage.replace(path)
+        command(['logrotate', '-d', '/etc/logrotate.conf'])
+        command(['systemctl', 'daemon-reload'])
+        command(['systemctl', 'restart', 'x-ui'])
+        command(['systemctl', 'is-active', 'x-ui'])
+        command(['systemctl', 'is-enabled', 'x-ui'])
+        command(['systemctl', 'is-active', 'logrotate.timer'])
+        metrics = command(['systemctl', 'show', 'x-ui', '-p', 'MemoryCurrent', '-p', 'ActiveState', '-p', 'UnitFileState'])
+        print('Core:', version)
+        print('Backup verified:', reports[0].parent)
+        print('Logrotate configuration: PASS (daily checks, 10 MiB maxsize trigger, 7 archives)')
+        print('Journal rate limit: 200 messages / 30 seconds')
+        print('Service restart and autostart: PASS')
+        print(metrics.strip())
+        print('Log bytes:', sum(p.stat().st_size for p in Path('@@XUI_LOG_DIR@@').glob('*.log') if p.is_file()))
+        (backup/'result.txt').write_text(version+'\n'+metrics)
+        print('Previous logging configuration:', backup)
+        print('Now run audit-server.py and repeat the Mac proxy/direct checks.')
+    except Exception as error:
+        for path, content in previous.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(content)
+                path.chmod(0o644)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        subprocess.run(['systemctl', 'restart', 'x-ui'], capture_output=True)
+        print('Logging setup failed:', type(error).__name__)
+        print('Previous logging configuration restored; inspect service state locally.')
+        print('Protected backup:', backup)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

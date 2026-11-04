@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Read-only post-reboot validation; does not restart or change services."""
+import json
+import os
+import subprocess
+from pathlib import Path
+
+if os.geteuid() != 0:
+    raise SystemExit('Run with sudo python3 scripts/proxy/verify-after-reboot.py')
+root = Path(__file__).resolve().parents[2]
+previous = json.loads((root/'.private/pre-reboot.json').read_text())
+current = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+if current == previous['boot_id']:
+    raise SystemExit('Boot changed: NO. Machine has not rebooted since the recorded snapshot; do not count this as boot acceptance.')
+print('Boot changed: PASS')
+failed = False
+for name,args in [
+    ('x-ui active',['systemctl','is-active','x-ui']),
+    ('x-ui autostart',['systemctl','is-enabled','x-ui']),
+    ('log rotation timer',['systemctl','is-active','logrotate.timer']),
+]:
+    result = subprocess.run(args,capture_output=True,text=True,timeout=10)
+    ok = result.returncode == 0
+    failed |= not ok
+    print(name + ': ' + ('PASS' if ok else 'FAIL'))
+loaded = Path('/sys/module/tcp_bbr').exists()
+failed |= not loaded
+print('BBR module loaded: ' + ('PASS' if loaded else 'FAIL'))
+result = subprocess.run(['@@XUI_INSTALL_DIR@@/bin/xray-linux-amd64','version'],capture_output=True,text=True,timeout=10)
+version = result.stdout.splitlines()[0] if result.stdout else '(unavailable)'
+print('Core:',version)
+failed |= not version.startswith('Xray 26.10.31 ')
+listeners = subprocess.run(['ss','-H','-lnt'],capture_output=True,text=True,timeout=10)
+addresses = [line.split()[3] for line in listeners.stdout.splitlines() if len(line.split())>=5]
+for name,ok in [
+    ('@@PROXY_PORT@@ listener',any(a.endswith(':@@PROXY_PORT@@') for a in addresses)),
+    ('@@PANEL_PORT@@ local-only',bool([a for a in addresses if a.endswith(':@@PANEL_PORT@@')]) and all(a=='127.0.0.1:@@PANEL_PORT@@' for a in addresses if a.endswith(':@@PANEL_PORT@@'))),
+    ('@@SUBSCRIPTION_PORT@@ closed',not any(a.endswith(':@@SUBSCRIPTION_PORT@@') for a in addresses)),
+]:
+    failed |= not ok
+    print(name + ': ' + ('PASS' if ok else 'FAIL'))
+audit = subprocess.run(['python3',str(root/'scripts/proxy/audit-server.py')],capture_output=True,text=True,timeout=45)
+if audit.returncode == 0:
+    print(audit.stdout)
+    for expected in ['Xray_config_test: PASS','New_@@PROXY_PORT@@_socket_TCP_algorithm: bbr','Global_TCP_algorithm: cubic']:
+        failed |= expected not in audit.stdout
+else:
+    print('Config audit failed; details suppressed to protect credentials.')
+    failed=True
+print('Server post-boot checks:', 'FAIL' if failed else 'PASS')
+print('Mac proxy/direct requests must also be repeated; machine boot alone is not the complete acceptance.')
+raise SystemExit(1 if failed else 0)

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Persist the tested BBR module dependency, without changing global TCP defaults."""
+import json
+import os
+import sqlite3
+import subprocess
+import tempfile
+from pathlib import Path
+
+FILES = {
+    Path('/etc/modules-load.d/mac-reality-bbr.conf'): 'tcp_bbr\n',
+    Path('/etc/systemd/system/x-ui.service.d/60-mac-reality-bbr.conf'): '[Unit]\nAfter=systemd-modules-load.service\n',
+}
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo python3 scripts/proxy/persist-inbound-bbr.py')
+    with sqlite3.connect('file:@@XUI_DATA_DIR@@/x-ui.db?mode=ro', uri=True) as db:
+        rows = db.execute("SELECT stream_settings FROM inbounds WHERE port=@@PROXY_PORT@@ AND protocol='vless'").fetchall()
+    if len(rows) != 1:
+        raise SystemExit('Expected one stored VLESS port @@PROXY_PORT@@ inbound; no persistence files changed.')
+    stream = json.loads(rows[0][0])
+    sockopt = stream.get('sockopt', {})
+    stored = next((str(v) for k,v in sockopt.items() if k.lower() == 'tcpcongestion'), '')
+    if stored != 'bbr':
+        raise SystemExit('Stored panel inbound is not bbr; save/apply the panel setting first. No persistence files changed.')
+    if not Path('/sys/module/tcp_bbr').exists():
+        raise SystemExit('BBR module is not loaded; run the preparation script first.')
+    original = Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip()
+    os.umask(0o077)
+    backup = Path(tempfile.mkdtemp(prefix='mac-reality-bbr-persist-', dir='@@BACKUP_ROOT@@'))
+    backup.chmod(0o700)
+    previous = {}
+    try:
+        for path,text in FILES.items():
+            if path.is_symlink():
+                raise RuntimeError('Refusing symlink configuration')
+            previous[path] = path.read_bytes() if path.exists() else None
+            if path.exists(): (backup/path.name).write_bytes(previous[path])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd,name = tempfile.mkstemp(prefix='.mac-reality-', dir=path.parent)
+            with os.fdopen(fd,'w') as output: output.write(text)
+            staged = Path(name); staged.chmod(0o644); staged.replace(path)
+        reload = subprocess.run(['systemctl','daemon-reload'],capture_output=True,timeout=30)
+        if reload.returncode != 0: raise RuntimeError('systemd reload failed')
+        after = subprocess.run(['systemctl','show','x-ui','-p','After','--value'],capture_output=True,text=True,timeout=10)
+        if after.returncode != 0 or 'systemd-modules-load.service' not in after.stdout:
+            raise RuntimeError('Service ordering verification failed')
+        if Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip() != original:
+            raise RuntimeError('Global TCP algorithm changed concurrently')
+        (backup/'state.json').write_text(json.dumps({
+            'stored_inbound_algorithm':stored, 'global_algorithm':original,
+            'previous_files':{str(p):v.decode() if v is not None else None for p,v in previous.items()},
+        },indent=2)+'\n')
+        print('Stored panel inbound BBR: PASS')
+        print('Boot module loading configured: PASS')
+        print('x-ui starts after systemd-modules-load: PASS')
+        print('Global TCP algorithm retained:',original)
+        print('Previous persistence configuration:',backup)
+        print('No service restart or machine reboot performed. Actual boot recovery still requires testing.')
+    except Exception as error:
+        for path,content in previous.items():
+            if content is None: path.unlink(missing_ok=True)
+            else: path.write_bytes(content); path.chmod(0o644)
+        subprocess.run(['systemctl','daemon-reload'],capture_output=True)
+        print('Persistence failed:',type(error).__name__)
+        print('Previous files restored; protected record:',backup)
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

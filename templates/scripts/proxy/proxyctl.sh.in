@@ -1,0 +1,73 @@
+#!/bin/bash
+# Server diagnostics and bounded measurements only.
+set -euo pipefail
+export LC_ALL=C
+umask 077
+BASE=$(cd -- "$(dirname -- "$0")" && pwd)
+OS=$(uname -s)
+ACTION=${1:-help}
+shift || true
+verify_tools() {
+    [[ -f "$BASE/toolset.sha256" && ! -L "$BASE/toolset.sha256" ]] || { echo 'Missing toolset manifest; deploy the complete rendered toolset.' >&2; return 1; }
+    # Fixed file set: a manifest cannot select arbitrary files or shell fragments.
+    awk 'BEGIN{split("proxyctl.sh proxy-measure.sh proxy-report.sh proxy-targets.tsv",a); for(i in a) valid[a[i]]=1} NF!=2 || length($1)!=64 || $1~/[^0-9a-f]/ || !($2 in valid) || seen[$2]++ {bad=1} END{exit bad || NR!=4}' "$BASE/toolset.sha256" || return 1
+    (cd "$BASE" && shasum -a 256 -c toolset.sha256 >/dev/null)
+}
+doctor() {
+    verify_tools
+    systemctl is-active x-ui
+    systemctl show x-ui -p ActiveState -p NRestarts -p MemoryCurrent -p CPUUsageNSec
+    if [[ $EUID -eq 0 ]]; then python3 "$BASE/audit-server.py"; else echo 'config_audit=NOT_RUN (sudo required)'; fi
+}
+server_sample() {
+    local seconds=${1:-90} out=${2:-} pid i
+    [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -ge 4 && "$seconds" -le 600 ]] || return 2
+    [[ "$out" == /* && ! -e "$out" && ! -L "$out" ]] || { echo 'Use a new absolute private result directory.' >&2; return 2; }
+    mkdir -m 700 "$out"
+    vmstat 2 "$((seconds/2+1))" > "$out/vmstat.txt" &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+    for ((i=0;i<seconds;i+=5)); do
+        date -u +%Y-%m-%dT%H:%M:%SZ
+        systemctl show x-ui -p ActiveState -p NRestarts -p MemoryCurrent -p CPUUsageNSec
+        awk '/MemAvailable:|SwapTotal:|SwapFree:/{print}' /proc/meminfo
+        sleep 5
+    done > "$out/resources.txt"
+    wait "$pid"
+    trap - EXIT
+    # Metadata only, never read or print access logs.
+    python3 - "$out" <<'PY'
+import json,sys
+from pathlib import Path
+out=Path(sys.argv[1]); folder=Path('@@XUI_LOG_DIR@@')
+try: size=sum(p.stat().st_size for p in folder.iterdir() if p.suffix=='.log' and p.is_file()); status='observed'
+except OSError: size=None; status='unavailable'
+samples=[]
+for line in (out/'vmstat.txt').read_text().splitlines():
+    fields=line.split()
+    if len(fields)>=17 and all(x.isdigit() for x in fields): samples.append([int(x) for x in fields])
+samples=samples[1:] # vmstat first row is since boot, not an interval.
+result={'log_bytes':size,'log_metadata':status,'intervals':len(samples)}
+props={}
+for line in (out/'resources.txt').read_text().splitlines():
+    if '=' in line:
+        key,value=line.split('=',1);props.setdefault(key,[]).append(value)
+result['service_all_active']=bool(props.get('ActiveState')) and set(props['ActiveState'])=={'active'}
+result['restart_count_changed']=len(set(props.get('NRestarts',[])))>1
+mem=[int(v) for v in props.get('MemoryCurrent',[]) if v.isdigit()]
+if mem:result.update(service_memory_min_bytes=min(mem),service_memory_max_bytes=max(mem))
+if samples: result.update(cpu_busy_mean_pct=sum(100-s[14] for s in samples)/len(samples),cpu_busy_max_pct=max(100-s[14] for s in samples),swap_in_max_KiBps=max(s[6] for s in samples),swap_out_max_KiBps=max(s[7] for s in samples))
+(out/'summary.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result))
+PY
+}
+case "$ACTION" in
+    help|--help|-h) echo 'VPS: doctor | status | sample SECONDS NEW_PRIVATE_DIR | measure server-direct NEW_PRIVATE_DIR | report CSV [...]'; exit 0;;
+esac
+[[ "$OS" == Linux ]] || { echo 'Server-only tool; use Happ for client connections.' >&2; exit 2; }
+case "$ACTION" in
+    doctor|status) doctor "$@";;
+    sample) verify_tools; server_sample "$@";;
+    measure) verify_tools; [[ ${1:-} == server-direct ]] || exit 2; exec bash "$BASE/proxy-measure.sh" "$@";;
+    report) exec bash "$BASE/proxy-report.sh" "$@";;
+    *) echo 'Unknown server command.' >&2; exit 2;;
+esac

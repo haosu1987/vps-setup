@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Read the generated config as root; print structural checks, never secrets."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import socket
+import time
+
+if os.geteuid() != 0:
+    raise SystemExit('Run with sudo python3 scripts/proxy/audit-server.py')
+path = Path('@@XUI_INSTALL_DIR@@/bin/config.json')
+try:
+    config = json.loads(path.read_text())
+except (OSError, ValueError):
+    raise SystemExit('Config unavailable or invalid JSON; content suppressed.')
+ins = [i for i in config.get('inbounds', []) if str(i.get('port')) == '@@PROXY_PORT@@']
+print('Proxy_inbound_count:', len(ins))
+for inbound in ins:
+    stream = inbound.get('streamSettings', {})
+    reality = stream.get('realitySettings', {})
+    clients = inbound.get('settings', {}).get('clients', [])
+    print('VLESS:', inbound.get('protocol') == 'vless')
+    print('TCP_RAW:', stream.get('network', 'tcp') in ('tcp', 'raw'))
+    sockopt = stream.get('sockopt', {})
+    print('Inbound_TCP_congestion:', sockopt.get('tcpCongestion', sockopt.get('tcpcongestion')) or '(system default)')
+    print('Inbound_TCP_window_clamp:', sockopt.get('tcpWindowClamp', 0))
+    print('Inbound_TCP_max_segment:', sockopt.get('tcpMaxSeg', 0))
+    print('REALITY:', stream.get('security') == 'reality')
+    print('Target_matches_candidate:', reality.get('target', reality.get('dest')) == '@@REALITY_TARGET_HOST@@:@@HTTPS_PORT@@')
+    print('SNI_matches_candidate:', reality.get('serverNames') == ['@@REALITY_SERVER_NAME@@'])
+    print('REALITY_minClientVer:', reality.get('minClientVer') or '(unset)')
+    print('REALITY_maxClientVer:', reality.get('maxClientVer') or '(unset)')
+    print('REALITY_maxTimeDiff:', reality.get('maxTimeDiff', reality.get('maxTimediff', 0)))
+    print('REALITY_extra_signature_enabled:', bool(reality.get('mldsa65Seed')))
+    print('Private_key_present:', bool(reality.get('privateKey')))
+    print('Nonempty_short_id_present:', any(bool(s) for s in reality.get('shortIds', [])))
+    print('Client_count:', len(clients))
+    print('Client_IDs_present:', bool(clients) and all(bool(c.get('id')) for c in clients))
+    print('All_clients_Vision:', bool(clients) and all(c.get('flow') == 'xtls-rprx-vision' for c in clients))
+routing = config.get('routing', {})
+blocked = {o.get('tag') for o in config.get('outbounds', []) if o.get('protocol') == 'blackhole'}
+private = []
+for r in routing.get('rules', []):
+    if r.get('outboundTag') in blocked:
+        private.extend(r.get('ip', []))
+print('Routing_domain_strategy:', routing.get('domainStrategy', 'AsIs'))
+print('Private_IP_rule_present:', 'geoip:private' in private)
+print('Private_IP_rule_is_not_full_egress_verification: True')
+with tempfile.TemporaryFile() as log:
+    result = subprocess.run(
+        ['@@XUI_INSTALL_DIR@@/bin/xray-linux-amd64', 'run', '-test', '-config', str(path)],
+        cwd='@@XUI_INSTALL_DIR@@', stdout=log, stderr=log, timeout=30,
+        env={**os.environ, 'XRAY_LOCATION_ASSET': '@@XUI_INSTALL_DIR@@/bin'},
+    )
+print('Xray_config_test:', 'PASS' if result.returncode == 0 else 'FAIL (details suppressed)')
+print('Global_TCP_algorithm:', Path('/proc/sys/net/ipv4/tcp_congestion_control').read_text().strip())
+try:
+    with socket.create_connection(('127.0.0.1', @@PROXY_PORT@@), timeout=2) as probe:
+        peer_port = probe.getsockname()[1]
+        time.sleep(.1)
+        sample = subprocess.run(
+            ['ss', '-tin', 'state', 'established', '( sport = :@@PROXY_PORT@@ and dport = :' + str(peer_port) + ' )'],
+            capture_output=True, text=True, timeout=5,
+        )
+        algorithms = sorted({line.strip().split()[0] for line in sample.stdout.splitlines()
+                             if line.startswith((' ', '\t')) and 'cwnd:' in line})
+        print('New_@@PROXY_PORT@@_socket_TCP_algorithm:', ','.join(algorithms) if algorithms else '(unavailable)')
+except (OSError, subprocess.TimeoutExpired):
+    print('New_@@PROXY_PORT@@_socket_TCP_algorithm: (unavailable)')
+
+print('No credential values were printed. This command checks config structure; connectivity evidence is recorded separately.')

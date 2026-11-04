@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Capture host firewall state without changing rules or services.
+set -euo pipefail
+if [[ $EUID -ne 0 ]]; then
+    echo 'Run this script with sudo in your own terminal.' >&2
+    exit 1
+fi
+umask 077
+backup_dir=$(mktemp -d @@BACKUP_ROOT@@/proxy-preflight.XXXXXXXX)
+chmod 700 "$backup_dir"
+for tool in ufw nft iptables-save ip6tables-save; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf '%s: unavailable\n' "$tool"
+        continue
+    fi
+    case "$tool" in
+        ufw) args=(status verbose) ;;
+        nft) args=(list ruleset) ;;
+        *) args=() ;;
+    esac
+    if "$tool" "${args[@]}" >"$backup_dir/$tool.txt" 2>"$backup_dir/$tool.stderr"; then
+        printf '%s: captured\n' "$tool"
+    else
+        printf '%s: capture failed; see root-only backup\n' "$tool"
+    fi
+done
+if [[ -d /etc/ufw ]]; then
+    tar -czf "$backup_dir/ufw-config.tar.gz" -C /etc ufw
+fi
+ss -lnt >"$backup_dir/listeners.txt"
+ip route >"$backup_dir/routes.txt"
+printf 'Backup: %s\n' "$backup_dir"
+printf 'UFW: '
+if command -v ufw >/dev/null 2>&1; then
+    ufw status | head -n 1
+else
+    echo unavailable
+fi
+printf 'No firewall rules, services or ports were changed. Cloud firewall is not checked.\n'

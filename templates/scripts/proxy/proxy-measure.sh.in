@@ -1,0 +1,44 @@
+#!/bin/bash
+# Bounded server-direct requests only. No network changes.
+set -euo pipefail
+BASE=$(cd -- "$(dirname -- "$0")" && pwd)
+mode=${1:-}; out=${2:-}
+[[ "$mode" == server-direct && "$(uname -s)" == Linux ]] || {
+    echo 'Usage on Linux: proxy-measure.sh server-direct NEW_RESULT_DIRECTORY' >&2
+    exit 2
+}
+[[ "$out" == /* && ! -e "$out" && ! -L "$out" ]] || { echo 'Use a new absolute result directory.' >&2; exit 2; }
+check=$(dirname "$out")
+while [[ "$check" != / ]]; do
+    [[ ! -L "$check" && "$check" != */.. && "$check" != */../* ]] || exit 2
+    check=$(dirname "$check")
+done
+umask 077
+mkdir -m 700 "$out"
+platform=$(uname -s)
+printf 'time_utc,platform,mode,target,attempt,policy_note,curl_exit,http,dns_s,connect_s,tls_s,ttfb_s,total_s,bytes,speed_Bps\n' > "$out/metrics.csv"
+printf 'platform=%s\nmode=%s\naddress_family=IPv4\nroute_evidence=not-collected\n' "$platform" "$mode" > "$out/context.txt"
+if [[ -f "$BASE/toolset.sha256" ]]; then shasum -a 256 "$BASE/toolset.sha256" | awk '{print "toolset=" $1}' >> "$out/context.txt"; fi
+probe() {
+    local label=$1 url=$2 kind=$3 note=$4 attempt=$5 metrics code
+    local args=(--proxy '' --noproxy '*' -4 --silent --show-error --connect-timeout 4 --max-time 8 --max-filesize 1048576 -o /dev/null)
+    case "$kind" in range) args+=(--range 0-1048575 --max-time 15);; download) args+=(--max-time 15);; esac
+    # No redirects or cookies; a failed request is a result, not a missing row.
+    code=0
+    metrics=$(curl "${args[@]}" -w '%{http_code},%{time_namelookup},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total},%{size_download},%{speed_download}' "$url" 2>> "$out/errors.log") || code=$?
+    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$platform" "$mode" "$label" "$attempt" "$note" "$code" "$metrics" >> "$out/metrics.csv"
+    printf '%s %s attempt=%s exit=%s\n' "$mode" "$label" "$attempt" "$code"
+}
+for attempt in 1 2 3; do
+    while read -r label url kind note; do
+        [[ -n "$label" && "$label" != \#* && "$kind" == page ]] || continue
+        probe "$label" "$url" "$kind" "$note" "$attempt"
+    done < "$BASE/proxy-targets.tsv"
+done
+while read -r label url kind note; do
+    [[ -n "$label" && "$label" != \#* && "$kind" != page ]] || continue
+    probe "$label" "$url" "$kind" "$note" 1
+done < "$BASE/proxy-targets.tsv"
+printf 'complete\n' > "$out/COMPLETE"
+bash "$BASE/proxy-report.sh" "$out/metrics.csv" > "$out/summary.txt"
+cat "$out/summary.txt"
